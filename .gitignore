@@ -1,0 +1,25 @@
+# Build directories
+build*/
+out/
+
+# Packaging
+release/
+
+# Runtime artifacts (created next to the executable)
+config.ini
+keybinds.ini
+savestates/
+saves/
+shots/
+diagnostics/
+*.sav
+*.cycstate
+
+# Never commit copyrighted game data
+*.nes
+*.fds
+*.qd
+
+# Coverage capture helpers
+miss*.txt
+capture*.txt
