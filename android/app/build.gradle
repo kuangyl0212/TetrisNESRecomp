@@ -1,0 +1,67 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Reads keystore credentials from a properties file outside the repo
+// (e.g. ~/.keystore/pokeemerald.properties). If the file is missing,
+// release builds fall back to the debug signing config so that local
+// builds without credentials still work.
+def keystoreProps = new Properties()
+def keystorePropsFile = file("${System.getProperty('user.home')}/.keystore/pokeemerald.properties")
+if (keystorePropsFile.exists()) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
+android {
+    namespace 'com.tetris.recomp'
+    compileSdk 36
+    ndkVersion '26.3.11579264'
+
+    defaultConfig {
+        applicationId 'com.tetris.recomp'
+        minSdk 21
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+
+        ndk {
+            abiFilters 'armeabi-v7a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static'
+            }
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropsFile.exists()) {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // TEMP: run-as 可读内部存储诊断日志（音频问题排查用）
+            debuggable true
+            signingConfig keystorePropsFile.exists() ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    sourceSets.main.java.srcDirs += '../SDL2/android-project/app/src/main/java'
+    sourceSets.main.assets.srcDirs += ['src/main/assets']
+}

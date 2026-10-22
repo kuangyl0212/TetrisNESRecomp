@@ -1,0 +1,70 @@
+﻿diff --git a/runner/cyc/cyc_fds_save.inc b/runner/cyc/cyc_fds_save.inc
+index c2b1d97..dfb21aa 100644
+--- a/runner/cyc/cyc_fds_save.inc
++++ b/runner/cyc/cyc_fds_save.inc
+@@ -31,6 +31,9 @@
+ #include <sys/stat.h>
+ #define fds_mkdir(p) mkdir((p), 0755)
+ #endif
++#if defined(__ANDROID__)
++#include <SDL_system.h>
++#endif
+ 
+ enum { FDS_SAVE_IDLE_FRAMES = 60, FDS_SAVE_MAX_FRAMES = 3600 };
+ 
+@@ -69,13 +72,21 @@ static uint8_t *fds_read_whole(const char *path, size_t *size, bool *missing)
+     return buf;
+ }
+ 
+-/* The host's save directory is beside the executable, independent of cwd. */
++/* The host's save directory is beside the executable, independent of cwd.
++ * On Android the "executable directory" is read-only APK content, so the
++ * save lives under SDL's app-internal storage instead. */
+ static bool default_save_path(const char *image_path, const char *extension, char *out, size_t cap)
+ {
+     char dir[900] = ".";
+ #ifdef _WIN32
+     DWORD n = GetModuleFileNameA(NULL, dir, sizeof(dir));
+     if (n == 0 || n >= sizeof(dir)) strcpy(dir, ".");
++#elif defined(__ANDROID__)
++    {
++        const char *data_dir = getenv("NESRECOMP_DATA_DIR");
++        if (!(data_dir && *data_dir)) data_dir = SDL_AndroidGetInternalStoragePath();
++        if (data_dir && *data_dir) snprintf(dir, sizeof(dir), "%s", data_dir);
++    }
+ #else
+     ssize_t n = readlink("/proc/self/exe", dir, sizeof(dir) - 1);
+     if (n > 0) dir[n] = 0; else strcpy(dir, ".");
+diff --git a/runner/cyc/cyc_settings.c b/runner/cyc/cyc_settings.c
+index b9fe775..6debe12 100644
+--- a/runner/cyc/cyc_settings.c
++++ b/runner/cyc/cyc_settings.c
+@@ -6,6 +6,9 @@
+ #include <ctype.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(__ANDROID__)
++#include <SDL_system.h>
++#endif
+ #ifdef _WIN32
+ #include <windows.h>
+ #else
+@@ -37,6 +40,18 @@ const char *cyc_settings_default_path(void)
+ #ifdef _WIN32
+     DWORD n = GetModuleFileNameA(NULL, dir, sizeof(dir));
+     if (n == 0 || n >= sizeof(dir)) strcpy(dir, ".");
++#elif defined(__ANDROID__)
++    /* No /proc/self/exe to a writable directory on Android: the executable
++     * lives inside the read-only APK. The wrapper exports the app-internal
++     * storage as NESRECOMP_DATA_DIR (SDL's own path query can fail before
++     * SDL_Init); fall back to SDL's query, then to the current directory. */
++    const char *data_dir = getenv("NESRECOMP_DATA_DIR");
++    if (data_dir && *data_dir) {
++        snprintf(dir, sizeof(dir), "%s", data_dir);
++    } else {
++        const char *app = SDL_AndroidGetInternalStoragePath();
++        if (app && *app) snprintf(dir, sizeof(dir), "%s", app);
++    }
+ #else
+     ssize_t n = readlink("/proc/self/exe", dir, sizeof(dir) - 1);
+     if (n > 0) dir[n] = 0; else strcpy(dir, ".");

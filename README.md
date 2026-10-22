@@ -43,6 +43,34 @@ cmake --build build --config Release --parallel 8
 - The build produces `nes_game.exe` next to an `SDL2.dll` copy and the launcher
   `assets/` folder — keep them together.
 
+## Android build (experimental)
+
+The same source tree also builds an Android APK (Gradle + NDK + vendored SDL2,
+modeled after the pokeemerald-multiplatform project layout).
+
+Prerequisites: Android SDK (platform 36, NDK 26.3.11579264, CMake 3.22.1 via the
+SDK manager), Gradle 8.5, Python 3.11+.
+
+```bash
+./setup_android.sh                     # fetch submodules + apply the runner's Android patch
+cp /path/to/tetris.nes android/app/src/main/assets/tetris.nes   # your own ROM (not in the repo)
+cd android
+gradle assembleRelease
+# -> app/build/outputs/apk/release/app-release.apk
+```
+
+Notes:
+
+- `SDL2/` is vendored (not a submodule) because it carries an **AAudio
+  partial-write fix**: `aaudio_PlayDevice` used a 1 ms write timeout and
+  silently dropped unwritten frames on low-latency devices, garbling playback.
+  The fix retries partial writes with a 20 ms budget.
+- `patches/nesrecomp-android.patch` redirects the runner's config/save paths to
+  app-internal storage (`/proc/self/exe` is read-only APK content on Android).
+- The bundled ROM is copied from APK assets into internal storage at first
+  launch; the on-screen controls auto-hide while a physical gamepad is
+  connected.
+
 ## Usage
 
 Double-click `nes_game.exe` and pick your ROM in the launcher, or run it directly:
@@ -74,6 +102,8 @@ Gamepads work out of the box (first pad = player 1, hotplug supported).
 | `cyc_seeds.txt` | Interpreter-miss coverage seeds from tested playthrough routes |
 | `nesrecomp/` | Static recompiler framework (git submodule, pinned) |
 | `recomp-ui/` | Launcher / in-game UI (git submodule, pinned) |
+| `android/` | Android APK project (Gradle + vendored SDL2 + touch controls) |
+| `patches/` | Local runner fixes needed by the Android build (applied by `setup_android`) |
 
 ## Legal
 
