@@ -1,4 +1,18 @@
-﻿diff --git a/runner/cyc/cyc_fds_save.inc b/runner/cyc/cyc_fds_save.inc
+diff --git a/runner/cyc/cyc.cmake b/runner/cyc/cyc.cmake
+index 322602c..77d09ec 100644
+--- a/runner/cyc/cyc.cmake
++++ b/runner/cyc/cyc.cmake
+@@ -168,7 +168,8 @@ function(nesrecomp_cyc_enable_recomp_ui target)
+     recomp_target_launcher_ui(${target} CONSOLE nes ${boxart})
+     recomp_target_runtime_ui_sdlrenderer2(${target})
+     target_sources(${target} PRIVATE ${NESRECOMP_CYC_DIR}/cyc_ui_menu.c ${NESRECOMP_CYC_DIR}/cyc_ui_launcher.c
+-        ${NESRECOMP_CYC_DIR}/cyc_ui_imgui.cpp)
++        ${NESRECOMP_CYC_DIR}/cyc_ui_imgui.cpp ${NESRECOMP_CYC_DIR}/cyc_ui_savemgr.c
++        ${NESRECOMP_CYC_DIR}/cyc_slotshot.cpp)
+     target_compile_definitions(${target} PRIVATE CYC_WITH_RECOMP_UI)
+     if(RUI_ROM_SHA256)
+         target_compile_definitions(${target} PRIVATE "CYC_LAUNCHER_ROM_SHA256=\"${RUI_ROM_SHA256}\"")
+diff --git a/runner/cyc/cyc_fds_save.inc b/runner/cyc/cyc_fds_save.inc
 index c2b1d97..dfb21aa 100644
 --- a/runner/cyc/cyc_fds_save.inc
 +++ b/runner/cyc/cyc_fds_save.inc
@@ -35,6 +49,259 @@ index c2b1d97..dfb21aa 100644
  #else
      ssize_t n = readlink("/proc/self/exe", dir, sizeof(dir) - 1);
      if (n > 0) dir[n] = 0; else strcpy(dir, ".");
+diff --git a/runner/cyc/cyc_host.c b/runner/cyc/cyc_host.c
+index a05b7f9..e8a819c 100644
+--- a/runner/cyc/cyc_host.c
++++ b/runner/cyc/cyc_host.c
+@@ -981,6 +981,17 @@ static bool add_state_save(const char *spec)
+ #include "cyc_save.inc"
+ #ifndef CYC_ORACLE
+ #include "cyc_fds_save.inc"
++
++/* The boot alignment, remembered for cyc_host_power_cycle. */
++static uint8_t s_power_align;
++
++void cyc_host_power_cycle(void)
++{
++    cyc_power_on(s_power_align);
++    cyc_run_power_on();
++    fds_save_powered_on();
++    cyc_session_state_loaded();
++}
+ #endif
+ 
+ /* Shared with game-owned password saves and the launcher's password editor. */
+@@ -1470,6 +1481,7 @@ session_restart:
+ #ifndef CYC_ORACLE
+     printf("ppu: implementation=%s (build-fixed)\n", cyc_ppu_implementation());
+ #endif
++    s_power_align = (uint8_t)align;
+     cyc_power_on((uint8_t)align);
+ #ifdef CYC_GAME_ZAPPER_PORT
+     cyc_zapper_attach(CYC_GAME_ZAPPER_PORT);
+diff --git a/runner/cyc/cyc_host.h b/runner/cyc/cyc_host.h
+index 659f28f..68baedf 100644
+--- a/runner/cyc/cyc_host.h
++++ b/runner/cyc/cyc_host.h
+@@ -61,6 +61,9 @@ bool cyc_sdl_error_box(const char *title, const char *text);
+ 
+ /* Pacing: seconds per frame, and whether the frame just run may skip pacing
+  * and presentation (fast load during a disk load). */
++/* Hardware power-cycle: a fresh machine (battery saves kept, everything
++ * else back to power-on). The save manager's "load an empty slot" uses it. */
++void cyc_host_power_cycle(void);
+ double cyc_host_frame_seconds(void);
+ bool   cyc_host_frame_unpaced(void);
+ 
+diff --git a/runner/cyc/cyc_sdl.c b/runner/cyc/cyc_sdl.c
+index 150a0e8..20ff4cd 100644
+--- a/runner/cyc/cyc_sdl.c
++++ b/runner/cyc/cyc_sdl.c
+@@ -48,6 +48,8 @@
+ #endif
+ #include <SDL.h>
+ 
++#include <sys/stat.h>   /* save_slot_mtime: the slot file's mtime */
++
+ #include "cyc_core.h"
+ #include "cyc_disk_action.h"
+ #include "cyc_fds_bios.h"
+@@ -352,7 +354,7 @@ static void note(const char *title, const char *body)
+     fflush(stdout);
+ }
+ 
+-static void state_slot(char *out, size_t n)
++static void state_slot_n(char *out, size_t n, int slot)
+ {
+     char stem[512];
+     const char *base = s_image, *s1 = strrchr(s_image, '/'), *s2 = strrchr(s_image, '\\');
+@@ -364,7 +366,47 @@ static void state_slot(char *out, size_t n)
+     char dir[1100];
+     exe_path(dir, sizeof(dir), "saves");
+     make_dir(dir);
+-    snprintf(out, n, "%s/%s.%s", dir, stem, s_fds ? "state" : "cycstate");
++    /* Slot 0 keeps the original single-slot path (the F8/F9 shortcuts); the
++     * save manager's slots 1..3 gain a ".slotN" suffix and a screenshot. */
++    if (slot > 0)
++        snprintf(out, n, "%s/%s.slot%d.%s", dir, stem, slot, s_fds ? "state" : "cycstate");
++    else
++        snprintf(out, n, "%s/%s.%s", dir, stem, s_fds ? "state" : "cycstate");
++}
++
++static void state_slot(char *out, size_t n)
++{
++    state_slot_n(out, n, 0);
++}
++
++/* 24-bit BMP writer for the save-slot preview thumbnails: no decoder
++ * dependency on the menu side (SDL_LoadBMP reads it back). */
++static bool write_bmp(const char *path, const uint32_t *pic, int w, int h)
++{
++    FILE *f = fopen(path, "wb");
++    if (!f) return false;
++    uint32_t row = (uint32_t)w * 3, row_pad = (4 - row % 4) % 4;
++    uint32_t size = 54 + (row + row_pad) * (uint32_t)h;
++    uint8_t hdr[54] = {'B','M'};
++    hdr[2] = (uint8_t)size; hdr[3] = (uint8_t)(size >> 8); hdr[4] = (uint8_t)(size >> 16); hdr[5] = (uint8_t)(size >> 24);
++    hdr[10] = 54; hdr[14] = 40;
++    hdr[18] = (uint8_t)w; hdr[19] = (uint8_t)(w >> 8); hdr[20] = (uint8_t)(w >> 16); hdr[21] = (uint8_t)(w >> 24);
++    hdr[22] = (uint8_t)h; hdr[23] = (uint8_t)(h >> 8); hdr[24] = (uint8_t)(h >> 16); hdr[25] = (uint8_t)(h >> 24);
++    hdr[26] = 1; hdr[28] = 24;
++    bool ok = fwrite(hdr, 1, 54, f) == 54;
++    uint8_t *line = (uint8_t *)malloc(row + row_pad);
++    for (int y = h - 1; ok && y >= 0; --y) {
++        memset(line, 0, row + row_pad);
++        for (int x = 0; x < w; ++x) {
++            uint32_t px = pic[(size_t)y * w + x];   /* ARGB8888, as the texture eats it */
++            line[x * 3] = (uint8_t)px;              /* BMP wants blue first */
++            line[x * 3 + 1] = (uint8_t)(px >> 8);
++            line[x * 3 + 2] = (uint8_t)(px >> 16);
++        }
++        ok = fwrite(line, 1, row + row_pad, f) == row + row_pad;
++    }
++    free(line);
++    return fclose(f) == 0 && ok;
+ }
+ 
+ static bool save_state_to(const char *path, char *err, size_t n)
+@@ -404,6 +446,62 @@ static bool load_state_slot(void)
+     return ok;
+ }
+ 
++/* Save manager slots (1..3): the state plus a screenshot beside it. */
++static bool save_state_slot_n(int slot)
++{
++    char path[1200], err[256];
++    if (slot < 1) return save_state_slot();
++    state_slot_n(path, sizeof(path), slot);
++    bool ok = save_state_to(path, err, sizeof(err));
++    if (ok) {
++        int pw, ph;
++        const uint32_t *pic = picture(&pw, &ph);
++        if (pic && pw > 0 && ph > 0) {
++            char shot[1240];
++            snprintf(shot, sizeof(shot), "%s.bmp", path);
++            if (!write_bmp(shot, pic, pw, ph)) ok = false;
++        }
++    }
++    note(ok ? "STATE SAVED" : "STATE NOT SAVED", ok ? NULL : err);
++    return ok;
++}
++
++static bool load_state_slot_n(int slot)
++{
++    char path[1200], err[256];
++    if (slot < 1) return load_state_slot();
++    state_slot_n(path, sizeof(path), slot);
++    bool ok = load_state_from(path, err, sizeof(err));
++    note(ok ? "STATE LOADED" : "STATE NOT LOADED", ok ? NULL : err);
++    return ok;
++}
++
++/* The save manager's probe: a slot's state file and its screenshot. */
++static void save_slot_paths(int slot, char *state, size_t state_n, char *shot, size_t shot_n)
++{
++    state_slot_n(state, state_n, slot);
++    snprintf(shot, shot_n, "%s.bmp", state);
++}
++
++static bool save_slot_mtime(const char *path, long long *mtime)
++{
++    struct stat st;
++    if (stat(path, &st) != 0) return false;   /* mingw-w64 / MSVC / POSIX all provide stat() */
++    *mtime = (long long)st.st_mtime;
++    return true;
++}
++
++static bool delete_state_slot_n(int slot)
++{
++    char state[1200], shot[1240];
++    if (slot < 1) return false;
++    state_slot_n(state, sizeof(state), slot);
++    snprintf(shot, sizeof(shot), "%s.bmp", state);
++    remove(state);
++    remove(shot);
++    return true;
++}
++
+ static int logical_h(void) { return s_tex_h + (s_bar ? BAR_ROWS : 0); }
+ 
+ static void apply_picture_scale(void)
+@@ -1255,7 +1353,8 @@ static void menu_nav_button(int button)
+ static bool menu_open(void)
+ {
+ #ifdef CYC_WITH_RECOMP_UI
+-    return s_have_menu && cyc_ui_menu_open();
++    /* The save manager pauses the game exactly like the menu. */
++    return s_have_menu && (cyc_ui_menu_open() || cyc_ui_savemgr_open());
+ #else
+     return false;
+ #endif
+@@ -1324,8 +1423,30 @@ int cyc_sdl_main(const char *title_in, int scale)
+         cyc_video_window_resized(ow, oh);
+     }
+ #ifdef CYC_WITH_RECOMP_UI
+-    CycUiHost host = { &s_set, s_extras, s_fds, apply_settings, save_settings, request_quit, frames_done, now_ms, title,
+-                       save_state_slot, load_state_slot, cyc_session_mods_provider(), s_image, cyc_session_mods_reapply };
++    /* Designated initializers: the struct grows between builds, and a
++     * positional list silently misassigns every field after the gap. */
++    CycUiHost host;
++    memset(&host, 0, sizeof(host));
++    host.settings = &s_set;
++    host.extras = s_extras;
++    host.fds = s_fds;
++    host.apply = apply_settings;
++    host.save = save_settings;
++    host.quit = request_quit;
++    host.frames_done = frames_done;
++    host.now_ms = now_ms;
++    host.title = title;
++    host.save_state = save_state_slot;
++    host.load_state = load_state_slot;
++    host.save_slot = save_state_slot_n;
++    host.load_slot = load_state_slot_n;
++    host.slot_paths = save_slot_paths;
++    host.slot_mtime = save_slot_mtime;
++    host.delete_slot = delete_state_slot_n;
++    host.reset = cyc_host_power_cycle;
++    host.mods = cyc_session_mods_provider();
++    host.image = s_image;
++    host.mods_changed = cyc_session_mods_reapply;
+     s_have_menu = cyc_ui_init(s_win, s_ren, &host);
+ #endif
+ 
+@@ -1362,6 +1483,7 @@ int cyc_sdl_main(const char *title_in, int scale)
+     int frames = 0, shot = 0;
+     long loops = 0;
+     bool prev[CYC_SC_COUNT] = { false };
++    bool selstart_prev = false;   /* Select+Start held together: the save manager */
+     bool hold_input = false;     /* after the menu closes: until every key is up */
+     bool was_open = false;
+     SDL_SetWindowTitle(s_win, title);
+@@ -1444,6 +1566,23 @@ int cyc_sdl_main(const char *title_in, int scale)
+         }
+         if (edge[CYC_SC_SAVE_STATE] && !menu_open()) save_state_slot();
+         if (edge[CYC_SC_LOAD_STATE] && !menu_open()) load_state_slot();
++        /* Select + Start together (either pad or the keys bound to them):
++         * the save manager. Its edge is on the NES pad state, so it works
++         * with every input source -- touch controls included. */
++        const bool selstart = (st.buttons[0] & 0x30) == 0x30;   /* Select | Start */
++        if (selstart && !selstart_prev
++#ifdef NESRECOMP_NET
++            && !nes_netplay_active()
++#endif
++        ) {
++#ifdef CYC_WITH_RECOMP_UI
++            if (s_have_menu) cyc_ui_savemgr_toggle();
++#endif
++            printf("[cyc ui] f=%ld save manager %s\n", s_frames_done,
++                   cyc_ui_savemgr_open() ? "open" : "closed");
++            fflush(stdout);
++        }
++        selstart_prev = selstart;
+         if (edge[CYC_SC_SCREENSHOT]) {
+             char name[64];
+             int pw, ph;
 diff --git a/runner/cyc/cyc_settings.c b/runner/cyc/cyc_settings.c
 index b9fe775..2f1cc93 100644
 --- a/runner/cyc/cyc_settings.c
@@ -105,11 +372,206 @@ index 0d80d9d..d87e82b 100644
      char netplay_player_name[64]; /* [Netplay] PlayerName */
      int  view_mode;         /* RECOMP_RUNTIME_UI_VIEW_* of a game that has view modes; 0 native */
      int  zapper_mouse, zapper_crosshair; /* [Zapper], booleans (both default on) */
+diff --git a/runner/cyc/cyc_slotshot.cpp b/runner/cyc/cyc_slotshot.cpp
+new file mode 100644
+index 0000000..272e141
+--- /dev/null
++++ b/runner/cyc/cyc_slotshot.cpp
+@@ -0,0 +1,88 @@
++// cyc_slotshot.cpp - the save-slot screenshot textures for the runtime menu's
++// row preview (cyc_ui.h, recomp-ui's config.preview). When the System page's
++// save-slot rows are selected, recomp-ui's ImGui presentation asks the host
++// (cyc_ui_menu.c's preview_for_item) for an image, which lands here: each
++// slot's screenshot is loaded once and rebuilt only when the file's
++// modification time changes (a new save or a delete).
++#include "cyc_ui.h"
++
++#include <SDL.h>
++
++#include <cstring>
++#include <cstdio>
++#include <sys/stat.h>
++
++namespace {
++
++constexpr int kSlots = 3;
++
++struct SlotTexture {
++    SDL_Texture *tex;
++    int w, h;
++    long long mtime;   // -1: nothing loaded
++    char path[1240];
++};
++
++SlotTexture s_slots[kSlots];
++SDL_Renderer *s_ren;
++
++bool mtime_of(const char *path, long long *out)
++{
++    struct stat st{};
++    if (stat(path, &st) != 0) return false;   // mingw-w64 / MSVC / POSIX all provide stat()
++    *out = (long long)st.st_mtime;
++    return true;
++}
++
++void release(SlotTexture &s)
++{
++    if (s.tex) SDL_DestroyTexture(s.tex);
++    s.tex = nullptr;
++    s.w = s.h = 0;
++    s.mtime = -1;
++    s.path[0] = 0;
++}
++
++}  // namespace
++
++extern "C" void cyc_slotshot_init(SDL_Renderer *ren)
++{
++    s_ren = ren;
++    for (SlotTexture &s : s_slots) release(s);
++}
++
++extern "C" int cyc_slotshot_texture(int slot, const char *shot_path,
++                                    void **texture, float *aspect)
++{
++    if (slot < 1 || slot > kSlots || !shot_path || !*shot_path || !s_ren) return 0;
++    SlotTexture &s = s_slots[slot - 1];
++    long long m = 0;
++    bool exists = mtime_of(shot_path, &m);
++    if (s.tex && (!exists || std::strcmp(s.path, shot_path) != 0 || m != s.mtime))
++        release(s);
++    if (!s.tex && exists) {
++        SDL_Surface *bmp = SDL_LoadBMP(shot_path);
++        if (bmp) {
++            s.tex = SDL_CreateTextureFromSurface(s_ren, bmp);
++            s.w = bmp->w;
++            s.h = bmp->h;
++            SDL_FreeSurface(bmp);
++            if (s.tex) {
++                snprintf(s.path, sizeof(s.path), "%s", shot_path);
++                s.mtime = m;
++            } else {
++                s.w = s.h = 0;
++            }
++        }
++    }
++    if (!s.tex || s.w <= 0 || s.h <= 0) return 0;
++    if (texture) *texture = (void *)s.tex;
++    if (aspect) *aspect = (float)s.w / (float)s.h;
++    return 1;
++}
++
++extern "C" void cyc_slotshot_shutdown(void)
++{
++    for (SlotTexture &s : s_slots) release(s);
++    s_ren = nullptr;
++}
+diff --git a/runner/cyc/cyc_ui.h b/runner/cyc/cyc_ui.h
+index 49641ff..9c374eb 100644
+--- a/runner/cyc/cyc_ui.h
++++ b/runner/cyc/cyc_ui.h
+@@ -45,6 +45,20 @@ typedef struct {
+     const char *title;                    /* the menu's title (the game) */
+     bool (*save_state)(void);             /* the save state slot (cyc_state.h) */
+     bool (*load_state)(void);
++    /* The save manager's numbered slots (1..N): the state file plus a
++     * screenshot beside it. NULL keeps the single-slot behaviour. */
++    bool (*save_slot)(int slot);
++    bool (*load_slot)(int slot);
++    /* Slot file layout probe and metadata for the save manager: slot_paths
++     * names the state file and its screenshot; slot_mtime reports a file's
++     * modification time (0/absent when it does not exist); delete_slot
++     * removes a slot's state and screenshot. */
++    void (*slot_paths)(int slot, char *state, size_t state_n, char *shot, size_t shot_n);
++    bool (*slot_mtime)(const char *state_path, long long *mtime);
++    bool (*delete_slot)(int slot);
++    /* Hardware power-cycle: a fresh machine (battery saves kept). Loading
++     * an empty slot starts here instead. */
++    void (*reset)(void);
+     /* The mod runtime's RecompLauncherCModProvider (NULL: no mods) and the
+      * image the game runs: the menu's Mods rows edit the features and their
+      * options live, commit them for this image, and call mods_changed to
+@@ -78,6 +92,18 @@ void cyc_ui_shutdown(void);
+ void cyc_ui_process_event(const union SDL_Event *ev);   /* ImGui's view of every event */
+ bool cyc_ui_menu_open(void);
+ void cyc_ui_toggle_menu(void);
++/* The save manager: a Select+Start surface separate from the settings menu
++ * (the game pauses with it up, exactly like the menu). It is recomp-ui's
++ * presentation on a small page of its own: a slot carousel plus the
++ * Load / Save / Delete actions. The cursor starts on Load; Left / Right
++ * choose the slot from anywhere on it. */
++bool cyc_ui_savemgr_create(const CycUiHost *host);
++void cyc_ui_savemgr_destroy(void);
++void cyc_ui_savemgr_toggle(void);
++bool cyc_ui_savemgr_open(void);
++/* Menu navigation values, routed here by cyc_ui_nav while it is open. */
++void cyc_ui_savemgr_input(int input, bool repeat);
++void cyc_ui_savemgr_render(void);
+ /* Menu navigation (RecompRuntimeUiInput values). */
+ void cyc_ui_nav(int input, bool repeat);
+ /* The toast (NULL, NULL clears it). */
+@@ -86,6 +112,15 @@ void cyc_ui_set_toast(const char *title, const char *body);
+  * any dev bar), at the window's full resolution. */
+ void cyc_ui_render(void);
+ 
++/* The save manager's slot screenshot, shown inside the runtime menu's panel
++ * (recomp-ui's config.preview) for the row under the selection. cyc_slotshot_init
++ * gives the texture cache its renderer; cyc_slotshot_texture loads a slot's
++ * screenshot (rebuilt when the file's mtime changes) and reports its aspect.
++ * All no-ops when the menu is absent. */
++void cyc_slotshot_init(struct SDL_Renderer *ren);
++int  cyc_slotshot_texture(int slot, const char *shot_path, void **texture, float *aspect);
++void cyc_slotshot_shutdown(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/runner/cyc/cyc_ui_imgui.cpp b/runner/cyc/cyc_ui_imgui.cpp
-index 6c75cf1..c30fce5 100644
+index 6c75cf1..4db6433 100644
 --- a/runner/cyc/cyc_ui_imgui.cpp
 +++ b/runner/cyc/cyc_ui_imgui.cpp
-@@ -41,6 +41,29 @@ extern "C" bool cyc_ui_init(SDL_Window *win, SDL_Renderer *ren, const CycUiHost
+@@ -3,6 +3,9 @@
+ // recomp-ui only draws into it. Everything here is drawn after the picture's
+ // texture is copied to the renderer, at the window's full resolution: the
+ // picture itself (cyc_frame_argb, screenshots, hashes) never contains it.
++//
++// The save manager (cyc_ui_savemgr.c) is a second recomp-ui instance drawn
++// through the same context; cyc_ui_render presents whichever is open.
+ #include "cyc_ui.h"
+ 
+ #include "recomp_runtime_ui.h"
+@@ -20,12 +23,18 @@ RecompRuntimeUi *cyc_ui_menu_create(const CycUiHost *host);
+ void cyc_ui_menu_destroy(void);
+ void cyc_ui_menu_refresh(void);
+ RecompRuntimeUi *cyc_ui_runtime(void);
++bool cyc_ui_savemgr_create(const CycUiHost *host);
++void cyc_ui_savemgr_destroy(void);
++bool cyc_ui_savemgr_open(void);
++void cyc_ui_savemgr_render(void);
+ }
+ 
+ namespace {
++
+ ImGuiContext *s_ctx;
+ SDL_Renderer *s_ren;
+ bool s_ready;
++
+ }
+ 
+ extern "C" bool cyc_ui_init(SDL_Window *win, SDL_Renderer *ren, const CycUiHost *host)
+@@ -34,6 +43,11 @@ extern "C" bool cyc_ui_init(SDL_Window *win, SDL_Renderer *ren, const CycUiHost
+         std::fprintf(stderr, "cyc ui: the runtime menu could not be created\n");
+         return false;
+     }
++    if (!cyc_ui_savemgr_create(host)) {
++        std::fprintf(stderr, "cyc ui: the save manager could not be created\n");
++        cyc_ui_menu_destroy();
++        return false;
++    }
+     IMGUI_CHECKVERSION();
+     s_ctx = ImGui::CreateContext();
+     ImGui::SetCurrentContext(s_ctx);
+@@ -41,6 +55,29 @@ extern "C" bool cyc_ui_init(SDL_Window *win, SDL_Renderer *ren, const CycUiHost
      io.IniFilename = nullptr;
      io.LogFilename = nullptr;
      ImGui::StyleColorsDark();
@@ -139,11 +601,114 @@ index 6c75cf1..c30fce5 100644
      if (!ImGui_ImplSDL2_InitForSDLRenderer(win, ren)) {
          std::fprintf(stderr, "cyc ui: ImGui SDL2 platform initialization failed\n");
          ImGui::DestroyContext(s_ctx);
+@@ -55,6 +92,7 @@ extern "C" bool cyc_ui_init(SDL_Window *win, SDL_Renderer *ren, const CycUiHost
+         return false;
+     }
+     s_ren = ren;
++    cyc_slotshot_init(ren);
+     s_ready = true;
+     return true;
+ }
+@@ -63,12 +101,14 @@ extern "C" void cyc_ui_shutdown(void)
+ {
+     if (s_ready) {
+         ImGui::SetCurrentContext(s_ctx);
++        cyc_slotshot_shutdown();
+         ImGui_ImplSDLRenderer2_Shutdown();
+         ImGui_ImplSDL2_Shutdown();
+         ImGui::DestroyContext(s_ctx);
+         s_ctx = nullptr;
+         s_ready = false;
+     }
++    cyc_ui_savemgr_destroy();
+     cyc_ui_menu_destroy();
+ }
+ 
+@@ -83,8 +123,10 @@ extern "C" void cyc_ui_render(void)
+ {
+     RecompRuntimeUi *ui = cyc_ui_runtime();
+     if (!s_ready || !ui) return;
+-    if (!recomp_runtime_ui_is_open(ui) && !recomp_runtime_ui_toast_visible(ui)) return;
+-    cyc_ui_menu_refresh();
++    if (!recomp_runtime_ui_is_open(ui) && !recomp_runtime_ui_toast_visible(ui) &&
++        !cyc_ui_savemgr_open())
++        return;
++    if (recomp_runtime_ui_is_open(ui)) cyc_ui_menu_refresh();
+     // The picture uses a logical size; the menu uses the whole drawable, then
+     // the picture's logical size and viewport come back for the next frame.
+     int lw = 0, lh = 0;
+@@ -98,6 +140,7 @@ extern "C" void cyc_ui_render(void)
+     ImGui_ImplSDL2_NewFrame();
+     ImGui::NewFrame();
+     recomp_runtime_ui_render_imgui(ui);
++    if (cyc_ui_savemgr_open()) cyc_ui_savemgr_render();
+     ImGui::Render();
+     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), s_ren);
+     SDL_RenderSetLogicalSize(s_ren, lw, lh);
 diff --git a/runner/cyc/cyc_ui_menu.c b/runner/cyc/cyc_ui_menu.c
-index f52abd0..5683d83 100644
+index f52abd0..87dbe48 100644
 --- a/runner/cyc/cyc_ui_menu.c
 +++ b/runner/cyc/cyc_ui_menu.c
-@@ -507,6 +507,11 @@ RecompRuntimeUi *cyc_ui_menu_create(const CycUiHost *host)
+@@ -24,6 +24,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #define MAX_SIDES 16
+ #define MAX_AXES 8
+@@ -304,6 +305,7 @@ static int get_value(void *ctx, const RecompRuntimeUiItem *it, int *out)
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) *out = s->linear_filter;
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_AUDIO)) *out = s->audio_enabled;
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VOLUME)) *out = s->volume;
++    else if (is_key(it, RECOMP_RUNTIME_UI_KEY_STATE_SLOT)) *out = s->state_slot;
+     else if (is_key(it, "cyc.zapper.mouse")) *out = s->zapper_mouse;
+     else if (is_key(it, "cyc.zapper.crosshair")) *out = s->zapper_crosshair;
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VIEW_MODE)) *out = x && x->get_view_mode ? x->get_view_mode(x->ctx) : s->view_mode;
+@@ -333,6 +335,7 @@ static int set_value(void *ctx, const RecompRuntimeUiItem *it, int v)
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) s->linear_filter = v != 0;
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_AUDIO)) s->audio_enabled = v != 0;
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VOLUME)) s->volume = v < 0 ? 0 : v > 100 ? 100 : v;
++    else if (is_key(it, RECOMP_RUNTIME_UI_KEY_STATE_SLOT)) s->state_slot = v < 1 ? 1 : v > 3 ? 3 : v;
+     else if (is_key(it, "cyc.zapper.mouse")) s->zapper_mouse = v != 0;
+     else if (is_key(it, "cyc.zapper.crosshair")) s->zapper_crosshair = v != 0;
+     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VIEW_MODE)) {
+@@ -361,6 +364,7 @@ static int run_action(void *ctx, const RecompRuntimeUiItem *it)
+     if(nes_netplay_active()&&(game_row(it)||is_key(it,RECOMP_RUNTIME_UI_KEY_LOAD_STATE)||is_key(it,RECOMP_RUNTIME_UI_KEY_SAVE_STATE)))return 0;
+ #endif
+     (void)ctx;
++    CycSettings *s = s_host.settings;
+     const CycHostExtras *x = s_host.extras;
+     long f = s_host.frames_done();
+     if (is_key(it, RECOMP_RUNTIME_UI_KEY_RESUME)) { recomp_runtime_ui_close(s_ui); return 1; }
+@@ -384,13 +388,22 @@ static int run_action(void *ctx, const RecompRuntimeUiItem *it)
+         return cyc_host_disk_press(now, f) != CYC_DISK_PRESS_NONE;
+     }
+     if (is_key(it, RECOMP_RUNTIME_UI_KEY_SAVE_STATE) && s_host.save_state) {
+-        bool ok = s_host.save_state();
+-        recomp_runtime_ui_set_status(s_ui, ok ? "State saved" : "The state was not saved");
++        /* The save manager's numbered slots when the host provides them;
++         * the single shared slot otherwise. The slot is the save manager
++         * window's carousel value (and its state persists). */
++        int slot = (s_host.save_slot && s_host.load_slot) ? s->state_slot : 0;
++        bool ok = slot > 0 ? s_host.save_slot(slot) : s_host.save_state();
++        char msg[96];
++        snprintf(msg, sizeof(msg), ok ? "Saved to slot %d" : "The state was not saved", slot);
++        recomp_runtime_ui_set_status(s_ui, ok ? msg : "The state was not saved");
+         return ok;
+     }
+     if (is_key(it, RECOMP_RUNTIME_UI_KEY_LOAD_STATE) && s_host.load_state) {
+-        bool ok = s_host.load_state();
+-        recomp_runtime_ui_set_status(s_ui, ok ? "State loaded" : "No state to load for this game");
++        int slot = (s_host.save_slot && s_host.load_slot) ? s->state_slot : 0;
++        bool ok = slot > 0 ? s_host.load_slot(slot) : s_host.load_state();
++        char msg[96];
++        snprintf(msg, sizeof(msg), ok ? "Loaded from slot %d" : "No state to load for this game", slot);
++        recomp_runtime_ui_set_status(s_ui, ok ? msg : "No state to load for this game");
+         if (ok) recomp_runtime_ui_close(s_ui);
+         return ok;
+     }
+@@ -507,6 +520,11 @@ RecompRuntimeUi *cyc_ui_menu_create(const CycUiHost *host)
      std.menu.theme = "nes";
      std.menu.accept_label = "Enter / A";
      std.menu.back_label = "Backspace / B";
@@ -155,3 +720,25 @@ index f52abd0..5683d83 100644
      std.menu.callbacks.get_value = get_value;
      std.menu.callbacks.set_value = set_value;
      std.menu.callbacks.run_action = run_action;
+@@ -545,12 +563,21 @@ bool cyc_ui_menu_open(void) { return s_ui && recomp_runtime_ui_is_open(s_ui); }
+ void cyc_ui_toggle_menu(void)
+ {
+     if (!s_ui) return;
++    /* Any UI-open shortcut dismisses the save manager first. */
++    if (cyc_ui_savemgr_open()) {
++        cyc_ui_savemgr_input(RECOMP_RUNTIME_UI_INPUT_BACK, false);
++        return;
++    }
+     if (recomp_runtime_ui_is_open(s_ui)) recomp_runtime_ui_close(s_ui);
+     else recomp_runtime_ui_open(s_ui);
+ }
+ 
+ void cyc_ui_nav(int input, bool repeat)
+ {
++    if (cyc_ui_savemgr_open()) {
++        cyc_ui_savemgr_input(input, repeat);
++        return;
++    }
+     if (s_ui) recomp_runtime_ui_handle_input(s_ui, (RecompRuntimeUiInput)input, 1, repeat ? 1 : 0);
+ }
+ 

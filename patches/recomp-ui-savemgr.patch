@@ -1,0 +1,416 @@
+diff --git a/src/common/backends/imgui/runtime_ui_imgui.cpp b/src/common/backends/imgui/runtime_ui_imgui.cpp
+index 9828773..8fab806 100644
+--- a/src/common/backends/imgui/runtime_ui_imgui.cpp
++++ b/src/common/backends/imgui/runtime_ui_imgui.cpp
+@@ -7,6 +7,7 @@
+ #include "imgui.h"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ 
+@@ -67,6 +68,7 @@ void draw_sections(RecompRuntimeUi *ui, const LauncherTheme &theme,
+         const bool selected = index == ui->section_index;
+         const bool clicked = ImGui::Selectable(ui->sections[index], selected, 0,
+                                                ImVec2(0.0f, theme.row_height));
++        if (selected) ImGui::SetScrollHereY(0.5f);
+         if ((clicked || ImGui::IsItemHovered()) &&
+             (index != ui->section_index || (clicked && enter_on_click))) {
+             const int was_in_section = ui->in_section;
+@@ -77,9 +79,100 @@ void draw_sections(RecompRuntimeUi *ui, const LauncherTheme &theme,
+     }
+ }
+ 
++// The card strip replacing a claimed row (a selector): the highlighted card
++// is the item's current value, NOT the row selection, so it stays put while
++// the player walks down to the rows that act on it. Clicking a card sets the
++// value; Left / Right on the row steps it (the model's ordinary CHOICE path).
++void draw_cards(RecompRuntimeUi *ui, const LauncherTheme &theme,
++                size_t strip_row, const RecompRuntimeUiItem *strip_item,
++                const RecompRuntimeUiCardView *cards,
++                int count, int active) {
++    const float gap = theme.spacing_sm;
++    const float avail_w = ImGui::GetContentRegionAvail().x;
++    const float card_w = (avail_w - gap * (count - 1)) / count;
++    const float img_w = card_w - theme.spacing_md;
++    float img_h = img_w;
++    for (int i = 0; i < count; ++i)
++        if (cards[i].image && cards[i].aspect > 0.0f)
++            img_h = img_w / cards[i].aspect;
++    const float caption_h = ImGui::GetTextLineHeight() * 2.1f;
++    const float card_h = img_h + caption_h;
++    const bool strip_selected = ui->in_section && strip_row == ui->row_index;
++    for (int i = 0; i < count; ++i) {
++        ImGui::PushID(i);
++        const ImVec2 start = ImGui::GetCursorScreenPos();
++        const bool active_card = i == active;
++        if (ImGui::Selectable("##card", strip_selected && active_card, 0,
++                              ImVec2(card_w, card_h))) {
++            /* A card tap chooses its slot; the row selection stays put. */
++            recomp_runtime_ui_set_item_value(ui, strip_item, i + 1);
++        }
++        ImDrawList *draw = ImGui::GetWindowDrawList();
++        const ImVec2 end(start.x + card_w, start.y + card_h);
++        draw->AddRectFilled(start, end,
++                            u32(active_card ? theme.control_hovered
++                                            : theme.panel));
++        draw->AddRect(start, end,
++                      u32(theme.border), 4.0f, 0, 0.5f);
++        const ImVec2 ip0(start.x + theme.spacing_md * 0.5f,
++                         start.y + theme.spacing_md * 0.5f);
++        const ImVec2 ip1(ip0.x + img_w, ip0.y + img_h);
++        if (cards[i].image) {
++            draw->AddImage((ImTextureID)(uintptr_t)cards[i].image, ip0, ip1);
++        } else {
++            draw->AddRectFilled(ip0, ip1, u32(theme.control));
++            const char *empty = "empty";
++            const ImVec2 ts = ImGui::CalcTextSize(empty);
++            draw->AddText(ImVec2((ip0.x + ip1.x - ts.x) * 0.5f,
++                                 (ip0.y + ip1.y - ts.y) * 0.5f),
++                          u32(theme.text_muted), empty);
++        }
++        draw->PushClipRect(start, end, true);
++        if (cards[i].caption && cards[i].caption[0])
++            draw->AddText(ImVec2(start.x + theme.spacing_md * 0.5f,
++                                 ip1.y + theme.spacing_sm),
++                          u32(active_card ? theme.accent2 : theme.text_muted),
++                          cards[i].caption);
++        draw->PopClipRect();
++        ImGui::PopID();
++        if (i + 1 < count) ImGui::SameLine(0.0f, gap);
++    }
++    ImGui::Dummy(ImVec2(0.0f, 0.0f));
++    if (strip_selected) ImGui::SetScrollHereY(0.0f);
++    ImGui::Separator();
++}
++
+ void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
+                 bool touch_friendly) {
+     const size_t count = recomp_runtime_ui_page_entry_count(ui);
++
++    /* One page item may be claimed by the preview hook as a card strip; it
++     * renders in place of its row, the rest as ordinary rows. */
++    size_t strip_row = 0;
++    const RecompRuntimeUiItem *strip_item = nullptr;
++    RecompRuntimeUiCardView strip_cards[16];
++    int strip_count = 0, strip_active = 0;
++    if (ui->config.preview.for_item) {
++        for (size_t index = 0; index < count && !strip_count; ++index) {
++            char folder[96];
++            const RecompRuntimeUiItem *item = recomp_runtime_ui_page_entry(
++                ui, index, folder, sizeof(folder));
++            if (!item) continue;
++            int active = 0;
++            int n = ui->config.preview.for_item(
++                ui->config.preview.context, item, strip_cards, 16, &active);
++            if (n > 0) {
++                strip_row = index;
++                strip_item = item;
++                strip_count = n;
++                strip_active = active >= 0 && active < n ? active : 0;
++            }
++        }
++    }
++    if (strip_count)
++        draw_cards(ui, theme, strip_row, strip_item, strip_cards,
++                   strip_count, strip_active);
++
+     for (size_t index = 0; index < count; ++index) {
+         char folder[96];
+         const RecompRuntimeUiItem *item = recomp_runtime_ui_page_entry(
+@@ -106,9 +199,12 @@ void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
+                 ui->row_index = index;
+                 ui->in_section = 1;
+             }
++            if (selected) ImGui::SetScrollHereY(0.5f);
+             ImGui::PopID();
+             continue;
+         }
++        if (strip_count && index == strip_row)
++            continue;   /* already drawn as the card strip */
+ 
+         const bool enabled = recomp_runtime_ui_item_enabled(ui, item) != 0;
+         const bool selected = ui->in_section && index == ui->row_index;
+@@ -146,6 +242,7 @@ void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
+             ui->row_index = index;
+             ui->in_section = 1;
+         }
++        if (selected) ImGui::SetScrollHereY(0.5f);
+ 
+         ImDrawList *draw = ImGui::GetWindowDrawList();
+         const ImVec2 end = ImGui::GetItemRectMax();
+@@ -319,6 +416,10 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+     const bool touch_friendly =
+         (ui->config.presentation_flags &
+          RECOMP_RUNTIME_UI_PRESENTATION_TOUCH_FRIENDLY) != 0;
++    /* A single-page surface: no section sidebar, no close button. */
++    const bool single =
++        (ui->config.presentation_flags &
++         RECOMP_RUNTIME_UI_PRESENTATION_SINGLE_PAGE) != 0;
+ 
+     ImGui::GetBackgroundDrawList()->AddRectFilled(
+         ImVec2(0.0f, 0.0f), display,
+@@ -375,6 +476,18 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+                 std::clamp(target_font_px / base_font_px, 1.0f, 4.0f);
+             ImGui::SetWindowFontScale(font_scale);
+         }
++        if (single) {
++            /* A single page, chrome-free: the rows are the surface -- no
++             * title, no nested panel, no scroll container, no hints. The
++             * content and the status line, nothing else. */
++            draw_items(ui, theme, touch_friendly);
++            if (ui->status_frames) {
++                ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
++                ImGui::TextUnformatted(ui->status);
++                ImGui::PopStyleColor();
++                recomp_runtime_ui_advance_status(ui, ImGui::GetIO().DeltaTime * 60.0f);
++            }
++        } else {
+         ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
+         ImGui::TextUnformatted(ui->config.title ? ui->config.title : "Settings");
+         ImGui::PopStyleColor();
+@@ -394,7 +507,7 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+             ? close_h + theme.spacing_sm * 2.0f
+             : ImGui::GetTextLineHeightWithSpacing() + theme.spacing_lg + 2.0f;
+         const float content_h = ImGui::GetContentRegionAvail().y - footer_h;
+-        if (wide) {
++        if (wide && !single) {
+             const float sidebar_w = touch_friendly
+                 ? std::clamp(width * 0.20f, 280.0f, 520.0f)
+                 : 190.0f;
+@@ -415,13 +528,24 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+             ImGui::Separator();
+             draw_items(ui, theme, touch_friendly);
+             ImGui::EndChild();
++        } else if (wide) {
++            /* A single page fills the panel: the rows are the whole width. */
++            ImGui::BeginChild("##items", ImVec2(0.0f, content_h), true);
++            char page_title[256];
++            recomp_runtime_ui_page_title(ui, page_title, sizeof(page_title));
++            ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
++            ImGui::TextUnformatted(page_title);
++            ImGui::PopStyleColor();
++            ImGui::Separator();
++            draw_items(ui, theme, touch_friendly);
++            ImGui::EndChild();
+         } else {
+             ImGui::BeginChild("##content", ImVec2(0.0f, content_h), true);
+             if (ui->in_section) {
+-                if (ImGui::SmallButton("< Back") &&
++                if (!single && ImGui::SmallButton("< Back") &&
+                     !recomp_runtime_ui_leave_folder(ui))
+                     recomp_runtime_ui_leave_section(ui);
+-                ImGui::SameLine();
++                if (!single) ImGui::SameLine();
+                 char page_title[256];
+                 recomp_runtime_ui_page_title(ui, page_title, sizeof(page_title));
+                 ImGui::TextUnformatted(page_title);
+@@ -462,6 +586,7 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+                              ImGui::GetStyle().WindowPadding.x - close_w);
+         if (ImGui::Button(close_label, ImVec2(close_w, close_h)))
+             recomp_runtime_ui_close(ui);
++        }
+     }
+     ImGui::End();
+     pop_runtime_style();
+diff --git a/src/common/recomp_runtime_ui.c b/src/common/recomp_runtime_ui.c
+index 809061c..3ee42de 100644
+--- a/src/common/recomp_runtime_ui.c
++++ b/src/common/recomp_runtime_ui.c
+@@ -147,6 +147,17 @@ static int row_selectable(const RecompRuntimeUi *ui, size_t row) {
+     return !item || recomp_runtime_ui_item_enabled(ui, item);
+ }
+ 
++/* A claimed card-strip row is not part of the Up / Down chain: the strip's
++ * value is chosen with Left / Right (or a card tap), never by selection. */
++static int row_is_strip(RecompRuntimeUi *ui, size_t row) {
++    if (!ui->config.preview.is_strip) return 0;
++    char folder[96];
++    const RecompRuntimeUiItem *item = recomp_runtime_ui_page_entry(
++        ui, row, folder, sizeof(folder));
++    return item &&
++           ui->config.preview.is_strip(ui->config.preview.context, item);
++}
++
+ /* A freshly opened page starts on its first row that can take the selection. */
+ static void select_first_row(RecompRuntimeUi *ui) {
+     const size_t count = recomp_runtime_ui_page_entry_count(ui);
+@@ -205,7 +216,13 @@ static void reset_page(RecompRuntimeUi *ui) {
+ static void visibility(RecompRuntimeUi *ui, int open) {
+     if (!ui || ui->open == open) return;
+     ui->open = open;
+-    if (!open) { ui->in_section = 0; reset_page(ui); }
++    if (!open) {
++        ui->in_section = 0;
++        reset_page(ui);
++    } else if (ui->config.presentation_flags &
++               RECOMP_RUNTIME_UI_PRESENTATION_SINGLE_PAGE) {
++        ui->in_section = 1;   /* a single page reopens inside itself */
++    }
+     if (ui->config.callbacks.visibility_changed)
+         ui->config.callbacks.visibility_changed(ui->config.callbacks.context, open);
+ }
+@@ -215,6 +232,8 @@ RecompRuntimeUi *recomp_runtime_ui_create(const RecompRuntimeUiConfig *config) {
+     RecompRuntimeUi *ui = (RecompRuntimeUi *)calloc(1, sizeof(*ui));
+     if (!ui) return NULL;
+     ui->config = *config;
++    if (config->presentation_flags & RECOMP_RUNTIME_UI_PRESENTATION_SINGLE_PAGE)
++        ui->in_section = 1;   /* no section step: the page is the surface */
+     ui->dim = RECOMP_RUNTIME_UI_DEFAULT_DIM;
+     ui->opacity = 1.0f;
+     ui->sections = (const char **)calloc(config->item_count, sizeof(*ui->sections));
+@@ -369,6 +388,31 @@ void recomp_runtime_ui_adjust_current(RecompRuntimeUi *ui, int direction,
+         accepted_change(ui, "Saved");
+ }
+ 
++int recomp_runtime_ui_set_item_value(RecompRuntimeUi *ui,
++                                     const RecompRuntimeUiItem *item,
++                                     int value) {
++    /* item may be the host's own copy: create_standard clones the item
++     * structs, so pointer identity with ui->config.items does NOT hold.
++     * The pointer only travels back to the host's own callbacks, which
++     * match items by key. */
++    if (!ui || !item || !ui->config.callbacks.set_value) return 0;
++    if (!recomp_runtime_ui_item_enabled(ui, item)) return 0;
++    int current = 0;
++    if (!recomp_runtime_ui_current_value(ui, item, &current)) return 0;
++    if (value == current) return 1;
++    if (!ui->config.callbacks.set_value(ui->config.callbacks.context, item,
++                                        value))
++        return 0;
++    return 1;
++}
++
++int recomp_runtime_ui_set_current_value(RecompRuntimeUi *ui, int value) {
++    char folder[96];
++    const RecompRuntimeUiItem *item = recomp_runtime_ui_page_entry(
++        ui, ui->row_index, folder, sizeof(folder));
++    return recomp_runtime_ui_set_item_value(ui, item, value);
++}
++
+ void recomp_runtime_ui_current_text(RecompRuntimeUi *ui,
+                                     const RecompRuntimeUiItem *item, char *buf,
+                                     size_t buf_size) {
+@@ -481,11 +525,12 @@ int recomp_runtime_ui_handle_input(RecompRuntimeUi *ui,
+     }
+     if (input == RECOMP_RUNTIME_UI_INPUT_BACK) {
+         if (!repeat) {
+-            if (ui->in_section) {
+-                if (!recomp_runtime_ui_leave_folder(ui))
+-                    recomp_runtime_ui_leave_section(ui);
+-            } else {
+-                recomp_runtime_ui_close(ui);
++            if ((ui->config.presentation_flags &
++                 RECOMP_RUNTIME_UI_PRESENTATION_SINGLE_PAGE) ||
++                !ui->in_section) {
++                recomp_runtime_ui_close(ui);   /* a single page: Back is close */
++            } else if (!recomp_runtime_ui_leave_folder(ui)) {
++                recomp_runtime_ui_leave_section(ui);
+             }
+         }
+         return 1;
+@@ -502,7 +547,10 @@ int recomp_runtime_ui_handle_input(RecompRuntimeUi *ui,
+         size_t row = ui->row_index;
+         for (size_t step = 0; step < count; ++step) {
+             row = wrap_index(row, delta, count);
+-            if (row_selectable(ui, row)) { ui->row_index = row; break; }
++            if (row_selectable(ui, row) && !row_is_strip(ui, row)) {
++                ui->row_index = row;
++                break;
++            }
+         }
+         return 1;
+     }
+@@ -511,6 +559,8 @@ int recomp_runtime_ui_handle_input(RecompRuntimeUi *ui,
+             if (!repeat) {
+                 recomp_runtime_ui_enter_section(ui, ui->section_index);
+             }
++        } else if (row_is_strip(ui, ui->row_index)) {
++            return 1;   /* the strip takes no Accept */
+         } else {
+             recomp_runtime_ui_adjust_current(ui, 1, 1, repeat);
+         }
+diff --git a/src/common/recomp_runtime_ui_internal.h b/src/common/recomp_runtime_ui_internal.h
+index 55bd754..4e8718b 100644
+--- a/src/common/recomp_runtime_ui_internal.h
++++ b/src/common/recomp_runtime_ui_internal.h
+@@ -82,6 +82,15 @@ int recomp_runtime_ui_current_value(RecompRuntimeUi *ui,
+                                     int *value);
+ void recomp_runtime_ui_adjust_current(RecompRuntimeUi *ui, int direction,
+                                       int activate, int repeat);
++/* Sets the current row's value directly (a card tap choosing its slot).
++ * Returns non-zero when the value was accepted. */
++int recomp_runtime_ui_set_current_value(RecompRuntimeUi *ui, int value);
++/* Sets one item's value directly (the save manager's Left / Right choosing
++ * the slot from whichever row the selection rests on). The item must belong
++ * to ui's config. Returns non-zero when the value was accepted. */
++int recomp_runtime_ui_set_item_value(RecompRuntimeUi *ui,
++                                     const RecompRuntimeUiItem *item,
++                                     int value);
+ void recomp_runtime_ui_enter_section(RecompRuntimeUi *ui, size_t section);
+ void recomp_runtime_ui_leave_section(RecompRuntimeUi *ui);
+ /* Rows of the page currently open inside a section (items and folders). */
+diff --git a/src/recomp_runtime_ui.h b/src/recomp_runtime_ui.h
+index 8d7775e..3a4dd44 100644
+--- a/src/recomp_runtime_ui.h
++++ b/src/recomp_runtime_ui.h
+@@ -130,6 +130,35 @@ typedef struct RecompRuntimeUiCallbacks {
+                     const char *value);
+ } RecompRuntimeUiCallbacks;
+ 
++/*
++ * Optional card strip: one item the hook claims renders as a strip of image
++ * tiles instead of a row -- a selector whose value the cards show (the save
++ * manager's "State slot" with its screenshots is the motivating case, but
++ * nothing here knows that). The strip's highlighted card follows the item's
++ * *value*, not the row selection, so it stays put while the player walks
++ * down to the action rows that act on it.
++ *
++ * for_item is called for each visible page item per frame. It returns the
++ * card count to claim the item (0: an ordinary row), filling cards[0..count)
++ * and *active with the highlighted card's index. image is a backend-specific
++ * handle (the ImGui one: an ImTextureID); NULL renders a placeholder tile.
++ */
++typedef struct RecompRuntimeUiCardView {
++    void *image;
++    float aspect;
++    const char *caption;   /* drawn under the tile; may be NULL */
++} RecompRuntimeUiCardView;
++
++typedef struct RecompRuntimeUiPreview {
++    void *context;
++    int (*for_item)(void *context, const RecompRuntimeUiItem *item,
++                    RecompRuntimeUiCardView *cards, int card_max, int *active);
++    /* Non-zero when the item IS the strip's row: Up / Down pass over it and
++     * Accept is a no-op there -- a strip's value is chosen with Left / Right
++     * or a card tap, never by row selection. */
++    int (*is_strip)(void *context, const RecompRuntimeUiItem *item);
++} RecompRuntimeUiPreview;
++
+ typedef struct RecompRuntimeUiConfig {
+     const char *title;
+     const char *subtitle;
+@@ -161,10 +190,22 @@ typedef struct RecompRuntimeUiConfig {
+      * the default, where every row can take the selection.
+      */
+     uint32_t navigation_flags;
++
++    /*
++     * Optional image the presentation draws inside its panel for the row
++     * under the selection. Zeroed fields disable it.
++     */
++    RecompRuntimeUiPreview preview;
+ } RecompRuntimeUiConfig;
+ 
+ enum {
+     RECOMP_RUNTIME_UI_PRESENTATION_TOUCH_FRIENDLY = UINT32_C(1) << 0,
++    /*
++     * A single-page surface: no section sidebar, no close button; the model
++     * starts inside the page and Back closes it. For hosts that present one
++     * purpose-built page (the save manager) through the same machinery.
++     */
++    RECOMP_RUNTIME_UI_PRESENTATION_SINGLE_PAGE = UINT32_C(1) << 1,
+ };
+ 
+ enum {

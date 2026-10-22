@@ -65,8 +65,10 @@ list(APPEND CYC_SOURCES
 # rows, and the launcher core that cyc_ui_launcher.c links against.
 set(RUI_MENU_SOURCES
     "${CYC}/cyc_ui_menu.c"
+    "${CYC}/cyc_ui_savemgr.c"
     "${CYC}/cyc_ui_launcher.c"
     "${CYC}/cyc_ui_imgui.cpp"
+    "${CYC}/cyc_slotshot.cpp"
     "${RUI_SRC}/common/recomp_runtime_ui.c"
     "${RUI_SRC}/common/recomp_runtime_settings.c"
     "${RUI_SRC}/common/backends/imgui/runtime_ui_imgui.cpp"
